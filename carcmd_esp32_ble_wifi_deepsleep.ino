@@ -1,290 +1,286 @@
-//
-// 1.BLE掃描與設備檢測：
-//   程式使用ESP32的BLE功能掃描附近的藍牙設備，並根據RSSI（信號強度指標）來判斷目標設備是否在範圍內。
-//   當檢測到目標設備（根據MAC地址和RSSI判斷）時，控制指定的GPIO針腳進行動作。
-//   如果設備在上次掃描中存在，而這次掃描中消失，則會觸發另一個動作。
-// 2.Wi-Fi連接與HTTP請求：
-//   系統每次喚醒後，如果沒有檢測到藍牙設備，則會嘗試連接指定的Wi-Fi網路並發送HTTP請求到指定的伺服器。
-//   如果收到伺服器的回應指示啟動操作，系統將會觸發繼電器以啟動設備（例如汽車）。
-// 3.深度睡眠管理：
-//   系統利用深度睡眠來節省電能。每次喚醒後，系統會進行BLE掃描和Wi-Fi連接操作，然後再次進入深度睡眠。
-//   深度睡眠時間設定為2秒，每次喚醒後檢查特定狀態以決定下一步操作。
-// 4.狀態保存：
-//   程式使用RTC內存保存上次藍牙檢測狀態和深度睡眠次數，以便在ESP32喚醒後可以繼續判斷是否需要進行Wi-Fi操作或觸發動作。
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <base64.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
+#include <NimBLEDevice.h>
 #include <esp_sleep.h>
 #include "esp32-hal-cpu.h"
 
-#define RELAY_PIN_A  5  // GPIO 5 鎖門
-#define RELAY_PIN_B  4 // GPIO 4 發車
-#define RELAY_PIN_C  15  // GPIO 12 開門
-#define POWER_PIN 25  // GPIO 25
-#define RSSI_THRESHOLD -90  // RSSI 閾值
-#define RSSI_SECOND_THRESHOLD -110  // 第二層RSSI閾值
-#define TIMEOUT 3000  // 超時時間3秒（3000毫秒）
-// 定義藍牙設備的MAC地址
-// String targetMacAddress = "df:65:fd:1f:21:22";
+#define RELAY_PIN_A  5  // GPIO 5 锁门
+#define RELAY_PIN_B  4  // GPIO 4 发车
+#define RELAY_PIN_C  15 // GPIO 15 开门
+#define POWER_PIN 25    // GPIO 25
+#define RSSI_THRESHOLD -90  // RSSI 阈值
+#define RSSI_SECOND_THRESHOLD -110  // 第二层RSSI阈值
+#define TIMEOUT 3000  // 超时时间3秒（3000毫秒）
+
 String targetMacAddress = "20:22:05:26:00:8d";
 
 const char* ssid = "opposky";
 const char* password = "0988085240";
 const char* url = "http://www.inskychen.com/carcmd/checkcarboot.php";
 
-BLEScan* pBLEScan;
-unsigned long lastDetectedTime = 0;  // 上次檢測到目標設備的時間戳
-bool deviceDetected = false;  // 記錄設備是否被檢測到
-bool bluetoothDeviceDetected = false;  // 標誌位，記錄是否檢測到藍牙設備
+NimBLEScan* pBLEScan;
+unsigned long lastDetectedTime = 0;  // 上次检测到目标设备的时间戳
+bool deviceDetected = false;  // 记录设备是否被检测到
+bool bluetoothDeviceDetected = false;  // 标志位，记录是否检测到蓝牙设备
 int mvRssi;
+bool BluetoothInRange = false;
+int thisAct = 0;  // 本次act
 
-// int sleepCounter = 0;  // 記錄深度睡眠次數
+RTC_DATA_ATTR bool lastBluetoothDetected = false;  // 使用RTC内存保存上次蓝牙检测状态
+RTC_DATA_ATTR int sleepCounter = 0;  // 使用RTC内存保存深度睡眠次数
+//RTC_DATA_ATTR int lastRssi = -999;  // 使用RTC内存最後一次訊號值
+RTC_DATA_ATTR int preAct = 1;  // 使用RTC内存上次act 0:fast 1:slow 2:open 3:lock
 
-RTC_DATA_ATTR bool lastBluetoothDetected = false;  // 使用RTC內存保存上次藍牙檢測狀態
-RTC_DATA_ATTR int sleepCounter = 0;  // 使用RTC內存保存深度睡眠次數
 
 void setup() {
-  Serial.begin(115200);
-  // 將核心速度設置為80 MHz
-  setCpuFrequencyMhz(80);
+    Serial.begin(115200);
+    setCpuFrequencyMhz(80);  // 将核心速度设为80 MHz
+    
+    thisAct = preAct;
+    // Serial.print("blue sacn 0 preAct=");
+    // Serial.println(preAct);
+    
+    NimBLEDevice::init("");  // 使用NimBLE库初始化
+    NimBLEDevice::setPower(ESP_PWR_LVL_N2);  // 设置较低的功率级别
 
-  BLEDevice::init("");
-  pBLEScan = BLEDevice::getScan(); // 創建新的掃描對象
-  pBLEScan->setActiveScan(false);   // 設置為主動掃描模式
-  pBLEScan->setInterval(100);      // 設置掃描間隔
-  pBLEScan->setWindow(99);         // 設置掃描窗口，應該小於或等於間隔值
+    pBLEScan = NimBLEDevice::getScan();  // 创建NimBLE扫描对象
+    pBLEScan->setActiveScan(false);  // 设置为被动扫描模式
+    pBLEScan->setInterval(100);  // 设置扫描间隔
+    pBLEScan->setWindow(99);  // 设置扫描窗口，应该小于或等于间隔值
 
-  // 設置為輸出模式，初始狀態為低電平
-  pinMode(RELAY_PIN_C, OUTPUT);
-  pinMode(RELAY_PIN_A, OUTPUT);
-  pinMode(RELAY_PIN_B, OUTPUT);
-  digitalWrite(RELAY_PIN_C, HIGH);
-  digitalWrite(RELAY_PIN_A, HIGH);
-  digitalWrite(RELAY_PIN_B, HIGH);
-  
-  pinMode(POWER_PIN, OUTPUT);
-  digitalWrite(POWER_PIN, LOW);  // 初始状态下关闭电源输出
-  
-  // 檢查深度睡眠恢復的次數
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-    sleepCounter++;
-    Serial.println(sleepCounter);
-  } else {
-    sleepCounter = 0;  // 如果是第一次啟動或非計時器喚醒，則重置計數器
-  }
-  
-  // 先掃描藍牙設備
-  mvRssi = -999;
-  BLEScanResults* foundDevices = pBLEScan->start(2, false);
-  bool found = handleScanResults(*foundDevices);
-  pBLEScan->clearResults();
+    // 设置为输出模式，初始状态为低电平
+    pinMode(RELAY_PIN_C, OUTPUT);
+    pinMode(RELAY_PIN_A, OUTPUT);
+    pinMode(RELAY_PIN_B, OUTPUT);
+    digitalWrite(RELAY_PIN_C, HIGH);
+    digitalWrite(RELAY_PIN_A, HIGH);
+    digitalWrite(RELAY_PIN_B, HIGH);
 
-  if (found) {
-    bluetoothDeviceDetected = true;  // 檢測到藍牙設備，設置標誌位
-    lastDetectedTime = millis();  // 更新最後檢測到目標設備的時間戳
-    if (!deviceDetected && !lastBluetoothDetected) {
-      // 如果之前未檢測到設備，現在檢測到了，且上次未檢測到設備
-      // 打开3.3V电源输出
-      digitalWrite(POWER_PIN, HIGH);
-      delay(1000);
-      Serial.println("開門1(藍牙信標出現）");
-      digitalWrite(RELAY_PIN_C, LOW);
-      delay(1000);
-      digitalWrite(RELAY_PIN_C, HIGH);
-      digitalWrite(POWER_PIN, LOW);
-      deviceDetected = true;
-      // Serial.println("開門2");
+    pinMode(POWER_PIN, OUTPUT);
+    digitalWrite(POWER_PIN, LOW);  // 初始状态下关闭电源输出
 
-    }
-    lastBluetoothDetected = true;  // 更新RTC內存中的檢測狀態
-  } else {
-    if (lastBluetoothDetected) {
-      // 如果上次檢測到設備，且這次沒有檢測到，則進行第二次檢查
-      // BLEScanResults* verifyDevices = pBLEScan->start(1, false);
-      // bool verify = verifyScanResults(*verifyDevices);
-      // pBLEScan->clearResults();
-      // Serial.println("check1");
-      // Serial.println(mvRssi);
-      // Serial.println(RSSI_SECOND_THRESHOLD);
-      
-      if (mvRssi <= RSSI_SECOND_THRESHOLD){
-      // if (!verify) {
-        // 如果第二次檢查確實沒檢測到設備，觸發未檢測到藍牙設備的動作
-        // 打开3.3V电源输出
-        digitalWrite(POWER_PIN, HIGH);
-        delay(1000);
-        Serial.println("鎖門1（藍牙信標消失）");
-        digitalWrite(RELAY_PIN_A, LOW);
-        delay(1000);
-        digitalWrite(RELAY_PIN_A, HIGH);
-        // 關閉3.3V电源输出
-        digitalWrite(POWER_PIN, LOW);
-        deviceDetected = false;
-        bluetoothDeviceDetected = false;  // 設備消失，清除藍牙設備標誌位
-        lastBluetoothDetected = false;  // 更新RTC內存中的檢測狀態
-        // Serial.println("鎖門2");
-      }
-    }
-  }
-
-  // 判斷是否應該進行 Wi-Fi 操作
-  if (sleepCounter >= 10) {
-    sleepCounter = 0;  // 重置計數器
-    if (!lastBluetoothDetected) {
-      connectToWiFi();
-
-      if (WiFi.status() == WL_CONNECTED) {
-        HTTPClient http;
-        WiFiClient client;
-
-        // 使用 WiFiClient 和 URL 初始化 HTTPClient
-        http.begin(client, url);
-
-        int httpCode = http.GET();  // 發送請求並獲取響應代碼
-
-        if (httpCode > 0) {
-          String payload = http.getString();  // 獲取網頁內容
-
-          // 檢查 "boot" 標籤是否為 "enable"
-          if (payload.indexOf("<boot>boot</boot>") != -1) {
-            triggerRelays();
-          } else {
-            Serial.println("Boot is not enabled.");
-          }
-        } else {
-          Serial.printf("GET failed, error: %s\n", http.errorToString(httpCode).c_str());
-        }
-        http.end();  // 結束 HTTP 請求
-      }
-
-      WiFi.disconnect();  // 斷開 Wi-Fi 連接
-      Serial.println("斷開WiFi, 進入深度睡眠模式...");
+    // 检查深度睡眠恢复的次数
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+        sleepCounter++;
+        Serial.println(sleepCounter);
     } else {
-      Serial.println("偵測到藍牙信標，跳過本次WIFI動作");
+        sleepCounter = 0;  // 如果是第一次启动或非计时器唤醒，则重置计数器
     }
-  }
-  
-  // 進入深度睡眠模式
-  // Serial.println("進入深度睡眠模式...");
-  esp_sleep_enable_timer_wakeup(3 * 1000000);  // 3秒後喚醒
-  esp_deep_sleep_start();
+
+    // 先扫描蓝牙设备
+    
+    mvRssi = -999;
+    NimBLEScanResults foundDevices = pBLEScan->start(2, false);  // 开始扫描
+    bool found = handleScanResults(foundDevices);
+    pBLEScan->clearResults();  // 清除扫描结果
+
+    if (found) {
+        bluetoothDeviceDetected = true;  // 检测到蓝牙设备，设置标志位
+        lastDetectedTime = millis();  // 更新最后检测到目标设备的时间戳
+        if (!deviceDetected && !lastBluetoothDetected) {
+            digitalWrite(POWER_PIN, HIGH);
+            delay(1000);
+            Serial.println("开门1(蓝牙信标出现）");
+            digitalWrite(RELAY_PIN_C, LOW);
+            delay(1000);
+            digitalWrite(RELAY_PIN_C, HIGH);
+            digitalWrite(POWER_PIN, LOW);
+            deviceDetected = true;
+            BluetoothInRange = false;
+            thisAct = 2;
+        }
+        lastBluetoothDetected = true;  // 更新RTC内存中的检测状态
+    } else {
+        if (lastBluetoothDetected) {
+            if (mvRssi <= RSSI_SECOND_THRESHOLD) {
+                digitalWrite(POWER_PIN, HIGH);
+                delay(1000);
+                Serial.println("锁门1（蓝牙信标消失）");
+                digitalWrite(RELAY_PIN_A, LOW);
+                delay(1000);
+                digitalWrite(RELAY_PIN_A, HIGH);
+                digitalWrite(POWER_PIN, LOW);
+                deviceDetected = false;
+                bluetoothDeviceDetected = false;  // 设备消失，清除蓝牙设备标志位
+                lastBluetoothDetected = false;  // 更新RTC内存中的检测状态
+                BluetoothInRange = false;
+                thisAct = 3;
+            }
+        }
+    }
+
+    // 判断是否应该进行 Wi-Fi 操作
+    if (sleepCounter >= 8) {
+        sleepCounter = 0;  // 重置计数器
+        if (!lastBluetoothDetected) {
+            connectToWiFi();
+
+            if (WiFi.status() == WL_CONNECTED) {
+                HTTPClient http;
+                WiFiClient client;
+
+                // 使用 WiFiClient 和 URL 初始化 HTTPClient
+                http.begin(client, url);
+
+                int httpCode = http.GET();  // 发送请求并获取响应代码
+
+                if (httpCode > 0) {
+                    String payload = http.getString();  // 获取网页内容
+
+                    // 检查 "boot" 标签是否为 "enable"
+                    if (payload.indexOf("<boot>boot</boot>") != -1) {
+                        triggerRelays();
+                    } else {
+                        Serial.println("Boot is not enabled.");
+                    }
+                } else {
+                    Serial.printf("GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+                }
+                http.end();  // 结束 HTTP 请求
+            }
+
+            WiFi.disconnect();  // 断开 Wi-Fi 连接
+            Serial.println("断开WiFi, 进入深度睡眠模式...");
+            thisAct = 1; 
+        } else {
+            Serial.println("检测到蓝牙信标，跳过本次WIFI动作");
+        }
+    }
+
+    // 进入深度睡眠模式
+    if (thisAct == preAct && thisAct != 0 && preAct != 0){ //0=fast
+      BluetoothInRange = false;
+      Serial.println("動作相同PASS");
+    }
+    Serial.print("thisAct=");
+    Serial.print(thisAct);
+    Serial.print(",preAct=");
+    Serial.println(preAct);
+    if (thisAct == 0 && preAct == 0){ //0=fast
+      BluetoothInRange = true;
+    }
+    preAct = thisAct;
+    if (BluetoothInRange){
+      Serial.println("进入深度睡眠模式(fast)...");
+      esp_sleep_enable_timer_wakeup(0.1 * 1000000);  // 0.1秒后唤醒
+      esp_deep_sleep_start();
+    }else{
+      Serial.println("进入深度睡眠模式(slow)...");
+      esp_sleep_enable_timer_wakeup(10 * 1000000);  // 3秒后唤醒
+      esp_deep_sleep_start();
+    }
 }
 
 void loop() {
-  // 空的主循環
+    // 空的主循环
 }
 
-bool handleScanResults(BLEScanResults& foundDevices) {
-  int count = foundDevices.getCount();
-  for (int i = 0; i < count; i++) {
-    BLEAdvertisedDevice device = foundDevices.getDevice(i);
-    int rssi = device.getRSSI(); // 獲取 RSSI 值
-    if (device.getAddress().toString() == targetMacAddress ) {
-      // Serial.print("rssi:");
-      // Serial.println(rssi);
-      mvRssi = rssi;
+bool handleScanResults(NimBLEScanResults& foundDevices) {
+    int count = foundDevices.getCount();
+    thisAct = 1; //1=slow
+    BluetoothInRange = false;
+    for (int i = 0; i < count; i++) {
+        NimBLEAdvertisedDevice device = foundDevices.getDevice(i);
+        int rssi = device.getRSSI();  // 获取 RSSI 值
+        if (device.getAddress().toString() == std::string(targetMacAddress.c_str())) {
+            Serial.print("rssi=");
+            Serial.println(rssi);
+            mvRssi = rssi;
+            //lastRssi = rssi;
+            BluetoothInRange = true;
+            if (preAct == 2){//2=open
+              thisAct = preAct; 
+            }else{
+              thisAct = 0;//0=fast
+            }
+            
+            // Serial.print("blue sacn thisAct=");
+            // Serial.println(thisAct);
+            //pBLEScan->stop();  // 停止扫描
+            
+        }
+        if (device.getAddress().toString() == std::string(targetMacAddress.c_str()) && rssi > RSSI_THRESHOLD) {
+            return true;  // 找到符合条件的设备
+        }
     }
-    if (device.getAddress().toString() == targetMacAddress && rssi > RSSI_THRESHOLD) {
-      return true;  // 找到符合條件的設備
-    }
-    // if (device.getAddress().toString() == targetMacAddress && rssi <= RSSI_SECOND_THRESHOLD) {
-    //   return false;  // 找到符合條件的設備
-    // }
-  }
-  return false;  // 沒有找到符合條件的設備
+    return false;  // 没有找到符合条件的设备
 }
 
 void connectToWiFi() {
-  int iCount = 0;
+    int iCount = 0;
 
-  // 掃描 Wi-Fi 網絡
-  int n = WiFi.scanNetworks();
-  bool ssidFound = false;
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == ssid) {
-      ssidFound = true;
-      break;
+    // 扫描 Wi-Fi 网络
+    int n = WiFi.scanNetworks();
+    bool ssidFound = false;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) == ssid) {
+            ssidFound = true;
+            break;
+        }
     }
-  }
 
-  // 如果未找到目標 SSID，等待一段時間然後再重試
-  if (!ssidFound) {
-    Serial.println("未找到目標 SSID，跳過本次WIFI動作...");
-    return;
-  }
-
-  // 連接 Wi-Fi
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1500);
-    Serial.print(".");
-    iCount++;
-    if (iCount > 20) {
-      Serial.println("停止連接");
-      break;
+    // 如果未找到目标 SSID，等待一段时间然后再重试
+    if (!ssidFound) {
+        Serial.println("未找到目标 SSID，跳过本次WIFI动作...");
+        return;
     }
-  }
-  if (iCount <= 20) {
-    Serial.println("WiFi connected");
-  } 
+
+    // 连接 Wi-Fi
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1500);
+        Serial.print(".");
+        iCount++;
+        if (iCount > 20) {
+            Serial.println("停止连接");
+            break;
+        }
+    }
+    if (iCount <= 20) {
+        Serial.println("WiFi connected");
+    } 
 }
 
 void triggerRelays() {
-  Serial.println("Engine start");
-  // 打开3.3V电源输出
-  digitalWrite(POWER_PIN, HIGH);
-  delay(1000);
+    Serial.println("Engine start");
+    digitalWrite(POWER_PIN, HIGH);  // 打开3.3V电源输出
+    delay(1000);
 
-  // 觸發繼電器 A 一秒
-  digitalWrite(RELAY_PIN_A, LOW);
-  delay(1500);
-  digitalWrite(RELAY_PIN_A, HIGH);
-  delay(500);
+    // 触发继电器 A 一秒
+    digitalWrite(RELAY_PIN_A, LOW);
+    delay(1500);
+    digitalWrite(RELAY_PIN_A, HIGH);
+    delay(500);
 
-  // 觸發繼電器 B 4秒
-  digitalWrite(RELAY_PIN_B, LOW);
-  delay(4000);
-  digitalWrite(RELAY_PIN_B, HIGH);
+    // 触发继电器 B 4秒
+    digitalWrite(RELAY_PIN_B, LOW);
+    delay(4000);
+    digitalWrite(RELAY_PIN_B, HIGH);
 
-  send_line("BVB-7980 啟動中...");
-  // 關閉3.3V电源输出
-  digitalWrite(POWER_PIN, LOW);
-  delay(30000);
+    send_line("BVB-7980 启动中...");
+    digitalWrite(POWER_PIN, LOW);  // 关闭3.3V电源输出
+    delay(30000);
 }
 
 void send_line(String msg) {
-  WiFiClient client;
-  HTTPClient http;
+    WiFiClient client;
+    HTTPClient http;
 
-  String encodedString = base64::encode(msg);
-  String url = "http://www.inskychen.com/sendtoline_car.php?msg=" + encodedString;
-  http.begin(client, url);
+    String encodedString = base64::encode(msg);
+    String url = "http://www.inskychen.com/sendtoline_car.php?msg=" + encodedString;
+    http.begin(client, url);
 
-  int httpCode = http.GET();
+    int httpCode = http.GET();
 
-  if (httpCode > 0) {
-    String payload = http.getString();
-    Serial.println(httpCode);
-    Serial.println(payload);
-  } else {
-    Serial.println("Error on HTTP request");
-  }
-
-  http.end();
-}
-
-bool verifyScanResults(BLEScanResults& foundDevices) {
-  int count = foundDevices.getCount();
-  for (int i = 0; i < count; i++) {
-    BLEAdvertisedDevice device = foundDevices.getDevice(i);
-    int rssi = device.getRSSI(); // 獲取 RSSI 值
-    if (device.getAddress().toString() == targetMacAddress && rssi > RSSI_SECOND_THRESHOLD) {
-      return true;  // RSSI 小於 -75，但大於 -90，視為設備仍然存在
+    if (httpCode > 0) {
+        String payload = http.getString();
+        Serial.println(httpCode);
+        Serial.println(payload);
+    } else {
+        Serial.println("Error on HTTP request");
     }
-  }
-  return false;  // RSSI 小於 -90，視為設備消失
+
+    http.end();
 }
