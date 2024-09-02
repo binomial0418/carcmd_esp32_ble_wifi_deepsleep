@@ -15,9 +15,9 @@
 
 String targetMacAddress = "20:22:05:26:00:8d";
 
-const char* ssid = "opposky";
-const char* password = "0988085240";
-const char* url = "http://www.inskychen.com/carcmd/checkcarboot.php";
+const char* ssid = "oppo";
+const char* password = "0988085";
+const char* url = "http://www.url.com/carcmd/checkcarboot.php";
 
 NimBLEScan* pBLEScan;
 // unsigned long lastDetectedTime = 0;  // 上次檢測到目標設備的時間戳
@@ -35,7 +35,6 @@ RTC_DATA_ATTR int preAct = 1;  // 使用 RTC 記憶體上次 act 0:fast 1:slow 2
 void setup() {
     Serial.begin(115200);
     setCpuFrequencyMhz(80);  // 將核心速度設為80 MHz
-    
     thisAct = preAct;
     // Serial.print("blue sacn 0 preAct=");
     // Serial.println(preAct);
@@ -110,7 +109,7 @@ void setup() {
     }
 
     // 判斷是否應該進行 Wi-Fi 操作
-    if (sleepCounter >= 8) {
+    if (sleepCounter >= 10) {
         sleepCounter = 0;  // 重置計數器
         if (!lastBluetoothDetected) {
             connectToWiFi();
@@ -166,7 +165,9 @@ void setup() {
       esp_deep_sleep_start();
     }else{
       Serial.println("進入深度睡眠模式(slow)...");
-      esp_sleep_enable_timer_wakeup(7 * 1000000);  // 8秒後喚醒
+      // 深度睡眠7秒 130 mWh
+      // 深度睡眠5秒 160 mWh
+      esp_sleep_enable_timer_wakeup(5 * 1000000);  // x秒後喚醒
       esp_deep_sleep_start();
     }
 }
