@@ -167,7 +167,7 @@ void setup() {
       esp_deep_sleep_start();
     }else{
       Serial.println("进入深度睡眠模式(slow)...");
-      esp_sleep_enable_timer_wakeup(10 * 1000000);  // 3秒后唤醒
+      esp_sleep_enable_timer_wakeup(8 * 1000000);  // 3秒后唤醒
       esp_deep_sleep_start();
     }
 }
