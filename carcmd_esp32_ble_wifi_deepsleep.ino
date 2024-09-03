@@ -8,15 +8,16 @@
 #define RELAY_PIN_A  5  // GPIO 5 鎖門
 #define RELAY_PIN_B  4  // GPIO 4 發車
 #define RELAY_PIN_C  15 // GPIO 15 開門
-#define POWER_PIN 25    // GPIO 25 鑰匙的3.3v電源
-#define RSSI_THRESHOLD -85  // RSSI 閾值
+#define POWER_PIN 26    // GPIO 26 鑰匙的3.3v電源
+ #define RSSI_THRESHOLD -95  // RSSI 閾值
+//#define RSSI_THRESHOLD -30 // RSSI 閾值
 #define RSSI_SECOND_THRESHOLD -120  // 第二層 RSSI 閾值
 
 String targetMacAddress = "20:22:05:26:00:8d";
 
 const char* ssid = "opposky";
-const char* password = "0988085";
-const char* url = "http://www.url.com/carcmd/checkcarboot.php";
+const char* password = "0988085240";
+const char* url = "http://www.inskychen.com/carcmd/checkcarboot.php";
 
 NimBLEScan* pBLEScan;
 bool deviceDetected = false;  // 記錄設備是否被檢測到
@@ -68,7 +69,7 @@ void setup() {
 
   // 先掃描藍牙設備
   mvRssi = -999;
-  NimBLEScanResults foundDevices = pBLEScan->start(2, false);  // 開始掃描
+  NimBLEScanResults foundDevices = pBLEScan->start(1.5, false);  // 開始掃描
   bool found = handleScanResults(foundDevices);
   pBLEScan->clearResults();  // 清除掃描結果
   //若上次動作為開門，但這次卻掃不到藍牙信標，需判斷是否因為藍牙信標突然消失所致，故要再檢查一次
@@ -77,6 +78,18 @@ void setup() {
     NimBLEScanResults foundDevices = pBLEScan->start(3, false);  
     found = handleScanResults(foundDevices);
     pBLEScan->clearResults();  // 清除掃描結果  
+  }
+  //若在藍牙範圍內但是不到觸發值，持續掃描一段時間
+  if (preAct != 2 && BluetoothInRange && !found){
+    for (int i = 0; i < 30; i++) {
+      Serial.print("進入快速掃描");
+      Serial.println(i);
+      NimBLEScanResults foundDevices = pBLEScan->start(1, false);  
+      found = handleScanResults(foundDevices);
+      if (found){
+        break;
+      }
+    }  
   }
   if (found) {
     bluetoothDeviceDetected = true;  // 檢測到藍牙設備，設置標誌位
@@ -117,7 +130,7 @@ void setup() {
   } 
   powerOn = false; //用來判斷是否第一次上電的循環，所以跑到這就要讓他false
   // 判斷是否應該進行 Wi-Fi 操作
-  if (sleepCounter >= 10) {
+  if (sleepCounter >= 14) {
     sleepCounter = 0;  // 重置計數器
     if (!lastBluetoothDetected) {
       connectToWiFi();
@@ -143,9 +156,10 @@ void setup() {
         }
         http.end();  // 結束 HTTP 請求
       }
-      WiFi.disconnect();  // 斷開 Wi-Fi 連接
+      
       Serial.println("斷開 WiFi, 進入深度睡眠模式...");
-      thisAct = 1; 
+      thisAct = 1;
+      WiFi.disconnect();  // 斷開 Wi-Fi 連接 
     } else {
       Serial.println("檢測到藍牙信標，跳過本次 WiFi 動作");
     }
@@ -170,9 +184,17 @@ void setup() {
     esp_deep_sleep_start();
   }else{
     Serial.println("進入深度睡眠模式(slow)...");
-    // 深度睡眠7秒 130 mWh
-    // 深度睡眠5秒 160 mWh
-    esp_sleep_enable_timer_wakeup(5 * 1000000);  // x秒後喚醒
+    // 深度睡眠7秒藍牙2秒   130 mWh
+    // 深度睡眠5秒藍牙2秒   160 mWh
+    // 深度睡眠5秒藍牙3秒   205 mWh
+    // 深度睡眠4秒藍牙3秒   240 mWh
+    // 深度睡眠3秒藍牙1.5秒 15次循環檢查一次wifi 168 mWh
+    if (thisAct ==2){ //2=open
+      esp_sleep_enable_timer_wakeup(3 * 1000000);  // x秒後喚醒
+    }else{
+      esp_sleep_enable_timer_wakeup(10 * 1000000);  // x秒後喚醒
+    }
+    
     esp_deep_sleep_start();
   }
 }
@@ -200,13 +222,16 @@ bool handleScanResults(NimBLEScanResults& foundDevices) {
       }
       // Serial.print("blue sacn thisAct=");
       // Serial.println(thisAct);
-      pBLEScan->stop();  // 停止掃描
       if (rssi > RSSI_THRESHOLD) {
         return true;  // 找到符合條件的設備
+        pBLEScan->stop();  // 停止掃描
       }
     }
   }
-  Serial.println("???");
+  if (!BluetoothInRange){
+    Serial.println("???");
+  }
+  
   return false;  // 沒有找到符合條件的設備
 }
 
@@ -253,7 +278,7 @@ void triggerRelays() {
 
   // 觸發繼電器 A 一秒
   digitalWrite(RELAY_PIN_A, LOW);
-  delay(1500);
+  delay(1000);
   digitalWrite(RELAY_PIN_A, HIGH);
   delay(500);
 
@@ -264,7 +289,7 @@ void triggerRelays() {
 
   send_line("BVB-7980 啟動中...");
   digitalWrite(POWER_PIN, LOW);  // 關閉3.3V電源輸出
-  delay(30000);
+  //delay(30000);
 }
 
 void send_line(String msg) {
