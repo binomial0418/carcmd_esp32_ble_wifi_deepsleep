@@ -69,13 +69,19 @@ void setup() {
 
   // 先掃描藍牙設備
   mvRssi = -999;
-  NimBLEScanResults foundDevices = pBLEScan->start(1.5, false);  // 開始掃描
+  NimBLEScanResults foundDevices = pBLEScan->start(2, false);  // 開始掃描
   bool found = handleScanResults(foundDevices);
   pBLEScan->clearResults();  // 清除掃描結果
   //若上次動作為開門，但這次卻掃不到藍牙信標，需判斷是否因為藍牙信標突然消失所致，故要再檢查一次
   if (!found && preAct == 2){
-    Serial.println("設備消失，第二次確認");
-    NimBLEScanResults foundDevices = pBLEScan->start(3, false);  
+    Serial.println("設備消失，第2次確認");
+    NimBLEScanResults foundDevices = pBLEScan->start(2, false);  
+    found = handleScanResults(foundDevices);
+    pBLEScan->clearResults();  // 清除掃描結果  
+  }
+  if (!found && preAct == 2){
+    Serial.println("設備消失，第3次確認");
+    NimBLEScanResults foundDevices = pBLEScan->start(2, false);  
     found = handleScanResults(foundDevices);
     pBLEScan->clearResults();  // 清除掃描結果  
   }
@@ -188,7 +194,8 @@ void setup() {
     // 深度睡眠5秒藍牙2秒   160 mWh
     // 深度睡眠5秒藍牙3秒   205 mWh
     // 深度睡眠4秒藍牙3秒   240 mWh
-    // 深度睡眠3秒藍牙1.5秒 15次循環檢查一次wifi 168 mWh
+    // 深度睡眠3秒藍牙1.5秒 15次循環檢查一次wifi 160 mWh
+    // 深度睡眠3秒藍牙2秒   15次循環檢查一次wifi  200mWh
     if (thisAct ==2){ //2=open
       esp_sleep_enable_timer_wakeup(3 * 1000000);  // x秒後喚醒
     }else{
@@ -258,7 +265,7 @@ void connectToWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(1500);
+    delay(500);
     Serial.print(".");
     iCount++;
     if (iCount > 20) {
