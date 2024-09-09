@@ -4,20 +4,23 @@
 #include <NimBLEDevice.h>
 #include <esp_sleep.h>
 #include "esp32-hal-cpu.h"
+#include <Wire.h>
+#include <RTClib.h>  // 引入 DS3231 RTC 庫
 
 #define RELAY_PIN_A  5  // GPIO 5 鎖門
 #define RELAY_PIN_B  4  // GPIO 4 發車
 #define RELAY_PIN_C  15 // GPIO 15 開門
 #define POWER_PIN 26    // GPIO 26 鑰匙的3.3v電源
- #define RSSI_THRESHOLD -95  // RSSI 閾值
+#define RSSI_THRESHOLD -110  // RSSI 閾值
 //#define RSSI_THRESHOLD -30 // RSSI 閾值
-#define RSSI_SECOND_THRESHOLD -120  // 第二層 RSSI 閾值
+#define RSSI_SECOND_THRESHOLD -130  // 第二層 RSSI 閾值
 
 String targetMacAddress = "20:22:05:26:00:8d";
+RTC_DS3231 rtc;
 
 const char* ssid = "opposky";
-const char* password = "0988085240";
-const char* url = "http://www.inskychen.com/carcmd/checkcarboot.php";
+const char* password = "0988085";
+const char* url = "http://www.url.com/carcmd/checkcarboot.php";
 
 NimBLEScan* pBLEScan;
 bool deviceDetected = false;  // 記錄設備是否被檢測到
@@ -25,6 +28,7 @@ bool bluetoothDeviceDetected = false;  // 標誌位，記錄是否檢測到藍�
 int  mvRssi;
 bool BluetoothInRange = false;
 int thisAct = 0;  // 本次 act
+bool isDeepRest = false;
 
 RTC_DATA_ATTR bool powerOn = true;  // 使用 RTC記憶體記錄是否為第一次上電，第一次上電不執行實際開鎖門動作
 RTC_DATA_ATTR bool lastBluetoothDetected = false;  // 使用 RTC 記憶體保存上次藍牙檢測狀態
@@ -35,30 +39,66 @@ void setup() {
   Serial.begin(115200);
   setCpuFrequencyMhz(80);  // 將核心速度設為80 MHz
   thisAct = preAct;
-  // Serial.print("blue sacn 0 preAct=");
-  // Serial.println(preAct);
-  // Serial.print("第一次上電：");
-  // Serial.println(powerOn);
-  
-  NimBLEDevice::init("");  // 使用 NimBLE 庫初始化
-  NimBLEDevice::setPower(ESP_PWR_LVL_N0);  // 設置率級別
+  // 初始化 I2C 和 RTC
+  Wire.begin(21, 22); // SDA = 21, SCL = 22
+  if (!rtc.begin()) {
+    Serial.println("無法找到 RTC");
+    while (1);
+  }
 
-  pBLEScan = NimBLEDevice::getScan();  // 創建 NimBLE 掃描對象
-  pBLEScan->setActiveScan(false);  // 設置為被動掃描模式
-  pBLEScan->setInterval(100);  // 設置掃描間隔
-  pBLEScan->setWindow(99);  // 設置掃描窗口，應該小於或等於間隔值
-
-  // 設置為輸出模式，初始狀態為低電平
+  // 如果 RTC 斷電，設置時間
+  if (rtc.lostPower()) {
+    Serial.println("RTC 斷電，設置時間!");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));  // 設置 RTC 為編譯時間
+  }
+  // 設置為輸出模式，初始狀態為低電平  
   pinMode(RELAY_PIN_C, OUTPUT);
-  pinMode(RELAY_PIN_A, OUTPUT);
-  pinMode(RELAY_PIN_B, OUTPUT);
   digitalWrite(RELAY_PIN_C, HIGH);
+  pinMode(RELAY_PIN_A, OUTPUT);
   digitalWrite(RELAY_PIN_A, HIGH);
+  pinMode(RELAY_PIN_B, OUTPUT);
   digitalWrite(RELAY_PIN_B, HIGH);
-
-  pinMode(POWER_PIN, OUTPUT);
+  pinMode(POWER_PIN, OUTPUT); //for key power
   digitalWrite(POWER_PIN, LOW);  // 初始狀態下關閉電源輸出
-
+  
+  // 檢查當前時間，如果在09:00到12:00之間，進入深度睡眠10秒
+  // 顯示當前時間
+  DateTime now = rtc.now();
+  Serial.print("目前時間：");
+  Serial.print(now.year(), DEC);
+  Serial.print('/');
+  Serial.print(now.month(), DEC);
+  Serial.print('/');
+  Serial.print(now.day(), DEC);
+  Serial.print(" ");
+  Serial.print(now.hour(), DEC);
+  Serial.print(':');
+  Serial.print(now.minute(), DEC);
+  Serial.print(':');
+  Serial.println(now.second(), DEC);
+  // 獲取星期幾（0 是星期天，1 是星期一，以此類推）
+  uint8_t dayOfWeek = now.dayOfTheWeek();
+  // 檢查當前時間，並根據條件進入深度睡眠模式
+  isDeepRest = false;
+  if (dayOfWeek >= 1 && dayOfWeek <= 7) { // 週一到週日
+    if (now.hour() >= 21 || now.hour() < 7) {
+      isDeepRest = true;
+    }
+  }
+  if (dayOfWeek >= 1 && dayOfWeek <= 4) { // 週一到週四
+    if ((now.hour() >= 9 && now.hour() < 12) || (now.hour() >= 13 && now.hour() < 17)) {
+      isDeepRest = true;
+    }
+  }
+  if (dayOfWeek = 5) { // 週五
+    if ((now.hour() >= 9 && now.hour() < 12)) {
+      isDeepRest = true;
+    }
+  }
+  //for test
+  if (now.minute() > 20 && now.minute() < 30){
+    isDeepRest = false;
+  }
   // 檢查深度睡眠恢復的次數
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
     sleepCounter++;
@@ -68,75 +108,86 @@ void setup() {
   }
 
   // 先掃描藍牙設備
-  mvRssi = -999;
-  NimBLEScanResults foundDevices = pBLEScan->start(2, false);  // 開始掃描
-  bool found = handleScanResults(foundDevices);
-  pBLEScan->clearResults();  // 清除掃描結果
-  //若上次動作為開門，但這次卻掃不到藍牙信標，需判斷是否因為藍牙信標突然消失所致，故要再檢查一次
-  if (!found && preAct == 2){
-    Serial.println("設備消失，第2次確認");
-    NimBLEScanResults foundDevices = pBLEScan->start(2, false);  
-    found = handleScanResults(foundDevices);
-    pBLEScan->clearResults();  // 清除掃描結果  
-  }
-  if (!found && preAct == 2){
-    Serial.println("設備消失，第3次確認");
-    NimBLEScanResults foundDevices = pBLEScan->start(2, false);  
-    found = handleScanResults(foundDevices);
-    pBLEScan->clearResults();  // 清除掃描結果  
-  }
-  //若在藍牙範圍內但是不到觸發值，持續掃描一段時間
-  if (preAct != 2 && BluetoothInRange && !found){
-    for (int i = 0; i < 30; i++) {
-      Serial.print("進入快速掃描");
-      Serial.println(i);
+  if (!isDeepRest){
+    NimBLEDevice::init("");  // 使用 NimBLE 庫初始化
+    NimBLEDevice::setPower(ESP_PWR_LVL_N14);  // 設置率級別
+
+    pBLEScan = NimBLEDevice::getScan();  // 創建 NimBLE 掃描對象
+    pBLEScan->setActiveScan(false);  // 設置為被動掃描模式
+    pBLEScan->setInterval(100);  // 設置掃描間隔
+    pBLEScan->setWindow(99);  // 設置掃描窗口，應該小於或等於間隔值
+    
+    mvRssi = -999;
+    NimBLEScanResults foundDevices = pBLEScan->start(2, false);  // 開始掃描
+    bool found = handleScanResults(foundDevices);
+    pBLEScan->clearResults();  // 清除掃描結果
+    //若上次動作為開門，但這次卻掃不到藍牙信標，需判斷是否因為藍牙信標突然消失所致，故要再檢查一次
+    if (!found && preAct == 2){
+      Serial.println("設備消失，第2次確認");
       NimBLEScanResults foundDevices = pBLEScan->start(1, false);  
       found = handleScanResults(foundDevices);
-      if (found){
-        break;
-      }
-    }  
-  }
-  if (found) {
-    bluetoothDeviceDetected = true;  // 檢測到藍牙設備，設置標誌位
-    if (!deviceDetected && !lastBluetoothDetected) {
-      if (!powerOn){
-        digitalWrite(POWER_PIN, HIGH);
-        delay(100);
-        digitalWrite(RELAY_PIN_C, LOW);
-        delay(1000);
-        digitalWrite(RELAY_PIN_C, HIGH);
-        digitalWrite(POWER_PIN, LOW);
-      }
-      Serial.println("開門(藍牙信標出現)");
-      deviceDetected = true;
-      BluetoothInRange = false;
-      thisAct = 2;
+      pBLEScan->clearResults();  // 清除掃描結果  
     }
-    lastBluetoothDetected = true;  // 更新 RTC 記憶體中的檢測狀態
-  } else {
-    if (lastBluetoothDetected) {
-      if (mvRssi <= RSSI_SECOND_THRESHOLD) {
+    if (!found && preAct == 2){
+      Serial.println("設備消失，第3次確認");
+      NimBLEScanResults foundDevices = pBLEScan->start(1, false);  
+      found = handleScanResults(foundDevices);
+      pBLEScan->clearResults();  // 清除掃描結果  
+    }
+    //若在藍牙範圍內但是不到觸發值，持續掃描一段時間
+    if (preAct != 2 && BluetoothInRange && !found){
+      for (int i = 0; i < 30; i++) {
+        Serial.print("進入快速掃描");
+        Serial.println(i);
+        NimBLEScanResults foundDevices = pBLEScan->start(1, false);  
+        found = handleScanResults(foundDevices);
+        if (found){
+          break;
+        }
+      }  
+    }
+    if (found) {
+      bluetoothDeviceDetected = true;  // 檢測到藍牙設備，設置標誌位
+      if (!deviceDetected && !lastBluetoothDetected) {
         if (!powerOn){
           digitalWrite(POWER_PIN, HIGH);
           delay(100);
-          digitalWrite(RELAY_PIN_A, LOW);
+          digitalWrite(RELAY_PIN_C, LOW);
           delay(1000);
-          digitalWrite(RELAY_PIN_A, HIGH);
+          digitalWrite(RELAY_PIN_C, HIGH);
           digitalWrite(POWER_PIN, LOW);
         }
-        Serial.println("鎖門(藍牙信標消失)");
-        deviceDetected = false;
-        bluetoothDeviceDetected = false;  // 設備消失，清除藍牙設備標誌位
-        lastBluetoothDetected = false;  // 更新 RTC 記憶體中的檢測狀態
+        Serial.println("開門(藍牙信標出現)");
+        deviceDetected = true;
         BluetoothInRange = false;
-        thisAct = 3;
+        thisAct = 2;
       }
-    }
-  } 
+      lastBluetoothDetected = true;  // 更新 RTC 記憶體中的檢測狀態
+    } else {
+      if (lastBluetoothDetected) {
+        if (mvRssi <= RSSI_SECOND_THRESHOLD) {
+          if (!powerOn){
+            digitalWrite(POWER_PIN, HIGH);
+            delay(100);
+            digitalWrite(RELAY_PIN_A, LOW);
+            delay(1000);
+            digitalWrite(RELAY_PIN_A, HIGH);
+            digitalWrite(POWER_PIN, LOW);
+          }
+          Serial.println("鎖門(藍牙信標消失)");
+          deviceDetected = false;
+          bluetoothDeviceDetected = false;  // 設備消失，清除藍牙設備標誌位
+          lastBluetoothDetected = false;  // 更新 RTC 記憶體中的檢測狀態
+          BluetoothInRange = false;
+          thisAct = 3;
+        }
+      }
+    } 
+  }
+  
   powerOn = false; //用來判斷是否第一次上電的循環，所以跑到這就要讓他false
   // 判斷是否應該進行 Wi-Fi 操作
-  if (sleepCounter >= 14) {
+  if (sleepCounter >= 24) {
     sleepCounter = 0;  // 重置計數器
     if (!lastBluetoothDetected) {
       connectToWiFi();
@@ -180,29 +231,24 @@ void setup() {
   Serial.print(thisAct);
   Serial.print(",preAct=");
   Serial.println(preAct);
-  if (thisAct == 0 && preAct == 0){ //0=fast
-    BluetoothInRange = true;
-  }
+  // if (thisAct == 0 && preAct == 0){ //0=fast
+  //   BluetoothInRange = true;
+  // }
   preAct = thisAct;
-  if (BluetoothInRange){
-    Serial.println("進入深度睡眠模式(fast)...");
-    esp_sleep_enable_timer_wakeup(0.1 * 1000000);  // 0.1秒後喚醒
-    esp_deep_sleep_start();
-  }else{
+  // 深度睡眠7秒藍牙2秒   130 mWh
+  // 深度睡眠5秒藍牙2秒   160 mWh
+  // 深度睡眠5秒藍牙3秒   205 mWh
+  // 深度睡眠4秒藍牙3秒   240 mWh
+  // 深度睡眠3秒藍牙1.5秒 15次循環檢查一次wifi 160 mWh
+  // 深度睡眠3秒藍牙2秒   15次循環檢查一次wifi  200mWh
+  if (isDeepRest){
     Serial.println("進入深度睡眠模式(slow)...");
-    // 深度睡眠7秒藍牙2秒   130 mWh
-    // 深度睡眠5秒藍牙2秒   160 mWh
-    // 深度睡眠5秒藍牙3秒   205 mWh
-    // 深度睡眠4秒藍牙3秒   240 mWh
-    // 深度睡眠3秒藍牙1.5秒 15次循環檢查一次wifi 160 mWh
-    // 深度睡眠3秒藍牙2秒   15次循環檢查一次wifi  200mWh
-    if (thisAct ==2){ //2=open
-      esp_sleep_enable_timer_wakeup(3 * 1000000);  // x秒後喚醒
-    }else{
-      esp_sleep_enable_timer_wakeup(10 * 1000000);  // x秒後喚醒
-    }
-    
-    esp_deep_sleep_start();
+    esp_sleep_enable_timer_wakeup(10 * 1000000);  // x秒後喚醒
+    esp_deep_sleep_start();  
+  } else {
+    Serial.println("進入深度睡眠模式(fast)...");
+    esp_sleep_enable_timer_wakeup(1 * 1000000);  // x秒後喚醒
+    esp_deep_sleep_start();  
   }
 }
 
